@@ -84,6 +84,24 @@ def validate_time_zone(v: t.Any) -> t.Optional[str]:
     return v
 
 
+def _canonicalize(obj: object) -> object:
+    """Recursively convert an object into a canonical, order-stable form for hashing.
+
+    ``set``/``frozenset`` iteration order is not stable across Python processes, so
+    pickling them directly yields non-deterministic bytes. That makes any hash derived
+    from the pickle (e.g. ``Config.fingerprint``) change run-to-run, which silently
+    invalidates on-disk caches keyed by the fingerprint. Sorting set members into a
+    list restores determinism while preserving contents.
+    """
+    if isinstance(obj, (set, frozenset)):
+        return sorted(map(_canonicalize, obj))  # type: ignore[type-var]
+    if isinstance(obj, dict):
+        return {k: _canonicalize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(map(_canonicalize, obj))
+    return obj
+
+
 if t.TYPE_CHECKING:
     from sqlmesh.core._typing import Self
 
@@ -377,4 +395,8 @@ class Config(BaseConfig):
 
     @property
     def fingerprint(self) -> str:
-        return str(zlib.crc32(pickle.dumps(self.dict(exclude={"loader", "notification_targets"}))))
+        return str(
+            zlib.crc32(
+                pickle.dumps(_canonicalize(self.dict(exclude={"loader", "notification_targets"})))
+            )
+        )

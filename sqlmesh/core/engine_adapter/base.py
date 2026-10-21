@@ -114,6 +114,7 @@ class EngineAdapter:
     SCHEMA_DIFFER_KWARGS: t.Dict[str, t.Any] = {}
     SUPPORTS_TUPLE_IN = True
     HAS_VIEW_BINDING = False
+    RECREATE_MATERIALIZED_VIEW_ON_EVALUATION = True
     SUPPORTS_REPLACE_TABLE = True
     SUPPORTS_GRANTS = False
     DEFAULT_CATALOG_TYPE = DIALECT
@@ -122,6 +123,10 @@ class EngineAdapter:
     ATTACH_CORRELATION_ID = True
     SUPPORTS_QUERY_EXECUTION_TRACKING = False
     SUPPORTS_METADATA_TABLE_LAST_MODIFIED_TS = False
+    RESOLVE_TABLE_REFS_IN_PHYSICAL_PROPERTIES: t.FrozenSet[str] = frozenset()
+    """Physical property keys whose values may contain logical model references that
+    should be resolved to physical table names during property rendering.  Engines that
+    need such resolution (e.g. StarRocks' excluded_trigger_tables) override this set."""
 
     def __init__(
         self,
@@ -173,6 +178,7 @@ class EngineAdapter:
             "query_execution_tracker": kwargs.pop(
                 "query_execution_tracker", self._query_execution_tracker
             ),
+            "pre_ping": kwargs.pop("pre_ping", self._pre_ping),
             **self._extra_config,
             **kwargs,
         }
@@ -217,6 +223,31 @@ class EngineAdapter:
     @property
     def catalog_support(self) -> CatalogSupport:
         return CatalogSupport.UNSUPPORTED
+
+    def supports_virtual_catalog(self) -> bool:
+        """Return True if this adapter can accept a virtual catalog for multi-gateway nesting alignment.
+
+        When a project mixes catalog-aware gateways (e.g. DuckDB) with catalog-unsupported gateways
+        (e.g. ClickHouse), all adapters need a uniform 3-level FQN so MappingSchema nesting stays
+        consistent. Adapters that return True here opt in to receiving an injected virtual catalog
+        via inject_virtual_catalog(), which causes the set_catalog decorator to strip the catalog
+        from DDL expressions rather than raising UnsupportedCatalogOperationError.
+        """
+        return False
+
+    def inject_virtual_catalog(self, gateway: str) -> None:
+        """Inject a gateway name to configure the adapter's virtual catalog.
+
+        The adapter determines the final catalog name from the gateway name (e.g. ClickHouse
+        wraps it as __{gateway}__). Only call this on adapters that return True from
+        supports_virtual_catalog(). After injection, catalog_support should return
+        SINGLE_CATALOG_ONLY so the set_catalog decorator strips the virtual catalog from DDL
+        expressions instead of raising an error.
+        """
+        raise NotImplementedError(
+            f"{self.dialect} does not support virtual catalog injection. "
+            "Override supports_virtual_catalog() to return True and implement inject_virtual_catalog()."
+        )
 
     @cached_property
     def schema_differ(self) -> SchemaDiffer:
@@ -295,8 +326,8 @@ class EngineAdapter:
                         )
                         for c in target_columns_to_types
                     ]
-                    query_factory = (
-                        lambda: exp.Select()
+                    query_factory = lambda: (
+                        exp.Select()
                         .select(*select_columns)
                         .from_(query_or_df.subquery("select_source_columns"))
                     )
@@ -1012,12 +1043,15 @@ class EngineAdapter:
     ) -> exp.Create:
         exists = False if replace else exists
         catalog_name = None
+        target_table: t.Optional[exp.Table] = None
         if not isinstance(table_name_or_schema, exp.Schema):
             table_name_or_schema = exp.to_table(table_name_or_schema)
             catalog_name = table_name_or_schema.catalog
+            target_table = table_name_or_schema
         else:
             if isinstance(table_name_or_schema.this, exp.Table):
                 catalog_name = table_name_or_schema.this.catalog
+                target_table = table_name_or_schema.this
 
         properties = (
             self._build_table_properties_exp(
@@ -1026,6 +1060,9 @@ class EngineAdapter:
                 target_columns_to_types=target_columns_to_types,
                 table_description=table_description,
                 table_kind=table_kind,
+                # Passed so an adapter can vary properties by target object, not just by
+                # connection. Additive: every override accepts **kwargs.
+                table=target_table,
             )
             if kwargs or table_description
             else None
@@ -1063,6 +1100,8 @@ class EngineAdapter:
         replace: bool = False,
         exists: bool = True,
         clone_kwargs: t.Optional[t.Dict[str, t.Any]] = None,
+        table_format: t.Optional[str] = None,
+        table_kind: t.Optional[str] = None,
         **kwargs: t.Any,
     ) -> None:
         """Creates a table with the target name by cloning the source table.
@@ -1072,6 +1111,10 @@ class EngineAdapter:
             source_table_name: The name of the source table that should be cloned.
             replace: Whether or not to replace an existing table.
             exists: Indicates whether to include the IF NOT EXISTS check.
+            clone_kwargs: Additional arguments for the CLONE clause.
+            table_format: The table format of the source table, if any. Engines that require
+                format-specific DDL to clone a table use it to derive `table_kind`.
+            table_kind: The kind of table to create. Defaults to `TABLE`.
         """
         if not self.SUPPORTS_CLONING:
             raise NotImplementedError(f"Engine does not support cloning: {type(self)}")
@@ -1080,7 +1123,7 @@ class EngineAdapter:
         self.execute(
             exp.Create(
                 this=exp.to_table(target_table_name),
-                kind="TABLE",
+                kind=table_kind or "TABLE",
                 replace=replace,
                 exists=exists,
                 clone=exp.Clone(
@@ -1183,9 +1226,15 @@ class EngineAdapter:
     def alter_table(
         self,
         alter_expressions: t.Union[t.List[exp.Alter], t.List[TableAlterOperation]],
+        table_format: t.Optional[str] = None,
     ) -> None:
         """
         Performs the alter statements to change the current table into the structure of the target table.
+
+        Args:
+            alter_expressions: The alter operations to apply.
+            table_format: The table format of the target table, if any. Engines that require
+                format-specific DDL to alter a table use it to adjust the generated statements.
         """
         with self.transaction():
             for alter_expression in [
@@ -1321,6 +1370,8 @@ class EngineAdapter:
                 else None
             ),
             physical_cluster=create_kwargs.pop("physical_cluster", None),
+            # See the note on the table-properties call site above.
+            table=exp.to_table(view_name),
         )
         if create_view_properties:
             for view_property in create_view_properties.expressions:
@@ -2727,6 +2778,35 @@ class EngineAdapter:
         **kwargs: t.Any,
     ) -> t.Optional[exp.Cluster]:
         return None
+
+    def adjust_physical_properties_for_incremental(
+        self,
+        physical_properties: t.Dict[str, t.Any],
+        *,
+        requires_delete_capable_table: bool,
+        unique_key: t.Optional[t.List[exp.Expr]],
+        model_name: str,
+    ) -> t.Dict[str, t.Any]:
+        """Adjusts physical properties for an incremental model before the table is created.
+
+        Some engines require a specific physical table layout before they can run the DELETE/MERGE
+        statements that incremental model kinds rely on (e.g. StarRocks only supports those on
+        PRIMARY KEY tables). This hook lets each engine derive or validate the required properties
+        while keeping the generic evaluator free of engine-specific branching.
+
+        Args:
+            physical_properties: The model's physical properties.
+            requires_delete_capable_table: Whether the model kind issues DELETE/MERGE statements
+                (as opposed to append-only INSERTs), as determined by the generic evaluator.
+            unique_key: The model's unique key, populated only when the kind allows promoting it to
+                an engine-specific key (i.e. INCREMENTAL_BY_UNIQUE_KEY); otherwise None.
+            model_name: The model name, for use in diagnostics.
+
+        Returns:
+            The (possibly adjusted) physical properties. Implementations own the given mapping and
+            may mutate it in place; the base implementation returns it unchanged.
+        """
+        return physical_properties
 
     def _build_table_properties_exp(
         self,

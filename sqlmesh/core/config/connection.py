@@ -2,43 +2,44 @@ from __future__ import annotations
 
 import abc
 import base64
+import importlib
 import logging
 import os
-import importlib
 import pathlib
 import re
 import typing as t
 from enum import Enum
 from functools import partial
+from sys import version_info
 
 import pydantic
-from pydantic import Field
-from pydantic_core import from_json
+from pydantic import Field, computed_field
 from packaging import version
+from pydantic_core import from_json
 from sqlglot import exp
-from sqlglot.helper import subclasses
 from sqlglot.errors import ParseError
+from sqlglot.helper import subclasses
 
 from sqlmesh.core import engine_adapter
 from sqlmesh.core.config.base import BaseConfig
 from sqlmesh.core.config.common import (
+    compile_regex_mapping,
     concurrent_tasks_validator,
     http_headers_validator,
-    compile_regex_mapping,
 )
-from sqlmesh.core.engine_adapter.shared import CatalogSupport
 from sqlmesh.core.engine_adapter import EngineAdapter
+from sqlmesh.core.engine_adapter.shared import CatalogSupport
 from sqlmesh.utils import debug_mode_enabled, str_to_bool
+from sqlmesh.utils.aws import validate_s3_uri
 from sqlmesh.utils.errors import ConfigError
 from sqlmesh.utils.pydantic import (
     ValidationInfo,
     field_validator,
+    get_concrete_types_from_typehint,
     model_validator,
     validation_data,
     validation_error_message,
-    get_concrete_types_from_typehint,
 )
-from sqlmesh.utils.aws import validate_s3_uri
 
 if t.TYPE_CHECKING:
     from sqlmesh.core._typing import Self
@@ -58,9 +59,14 @@ FORBIDDEN_STATE_SYNC_ENGINES = {
     "trino",
     # Nullable types are problematic
     "clickhouse",
+    "starrocks",
+    # Db2 rejects table names starting with underscore (_versions, _snapshots,
+    # _environments, _intervals). Use a separate state_connection (e.g., DuckDB).
+    "db2",
 }
 MOTHERDUCK_TOKEN_REGEX = re.compile(r"(\?|\&)(motherduck_token=)(\S*)")
 PASSWORD_REGEX = re.compile(r"(password=)(\S+)")
+SUPPORTS_MSSQL_PYTHON_DRIVER = (version_info.major, version_info.minor) >= (3, 10)
 
 
 def _get_engine_import_validator(
@@ -107,7 +113,14 @@ class ConnectionConfig(abc.ABC, BaseConfig):
     catalog_type_overrides: t.Optional[t.Dict[str, str]] = None
 
     # Whether to share a  single connection across threads or create a new connection per thread.
-    shared_connection: t.ClassVar[bool] = False
+    #
+    # MyPy throws a "Decorators on top of @property are not supported" error despite this being a
+    # valid decoration, and Pydantic recommend disabling the MyPy hint for this reason - see:
+    # https://pydantic.dev/docs/validation/2.0/usage/computed_fields/
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def shared_connection(self) -> bool:
+        return False
 
     @property
     @abc.abstractmethod
@@ -308,7 +321,10 @@ class BaseDuckDBConnectionConfig(ConnectionConfig):
 
     token: t.Optional[str] = None
 
-    shared_connection: t.ClassVar[bool] = True
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def shared_connection(self) -> bool:
+        return True
 
     _data_file_to_adapter: t.ClassVar[t.Dict[str, EngineAdapter]] = {}
 
@@ -817,10 +833,14 @@ class DatabricksConnectionConfig(ConnectionConfig):
     DISPLAY_NAME: t.ClassVar[t.Literal["Databricks"]] = "Databricks"
     DISPLAY_ORDER: t.ClassVar[t.Literal[3]] = 3
 
-    shared_connection: t.ClassVar[bool] = True
-
     _concurrent_tasks_validator = concurrent_tasks_validator
     _http_headers_validator = http_headers_validator
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def shared_connection(self) -> bool:
+        """The connection should only be shared if U2M OAuth is being used"""
+        return self.auth_type is not None and self.oauth_client_secret is None
 
     @model_validator(mode="before")
     def _databricks_connect_validator(cls, data: t.Any) -> t.Any:
@@ -961,7 +981,7 @@ class DatabricksConnectionConfig(ConnectionConfig):
                     # if a client_secret exists, then a client_id also exists and we are using M2M
                     # ref: https://docs.databricks.com/en/dev-tools/python-sql-connector.html#oauth-machine-to-machine-m2m-authentication
                     # ref: https://github.com/databricks/databricks-sql-python/blob/main/examples/m2m_oauth.py
-                    from databricks.sdk.core import oauth_service_principal, Config
+                    from databricks.sdk.core import Config, oauth_service_principal
 
                     config = Config(
                         host=f"https://{self.server_hostname}",
@@ -1117,8 +1137,8 @@ class BigQueryConnectionConfig(ConnectionConfig):
     def _static_connection_kwargs(self) -> t.Dict[str, t.Any]:
         """The static connection kwargs for this connection"""
         import google.auth
-        from google.auth import impersonated_credentials
         from google.api_core import client_info, client_options
+        from google.auth import impersonated_credentials
         from google.oauth2 import credentials, service_account
 
         if self.method == BigQueryConnectionMethod.OAUTH:
@@ -1318,6 +1338,7 @@ class RedshiftConnectionConfig(ConnectionConfig):
         region: The AWS region where the Amazon Redshift cluster is located.
         cluster_identifier: The cluster identifier of the Amazon Redshift cluster.
         iam: If IAM authentication is enabled. Default value is False. IAM must be True when authenticating using an IdP.
+        db_user: The database user to authenticate as. Required when using IAM authentication.
         is_serverless: Redshift end-point is serverless or provisional. Default value false.
         serverless_acct_id: The account ID of the serverless. Default value None
         serverless_work_group: The name of work group for serverless end point. Default value None.
@@ -1343,6 +1364,7 @@ class RedshiftConnectionConfig(ConnectionConfig):
     region: t.Optional[str] = None
     cluster_identifier: t.Optional[str] = None
     iam: t.Optional[bool] = None
+    db_user: t.Optional[str] = None
     is_serverless: t.Optional[bool] = None
     serverless_acct_id: t.Optional[str] = None
     serverless_work_group: t.Optional[str] = None
@@ -1380,6 +1402,7 @@ class RedshiftConnectionConfig(ConnectionConfig):
             "region",
             "cluster_identifier",
             "iam",
+            "db_user",
             "is_serverless",
             "serverless_acct_id",
             "serverless_work_group",
@@ -1516,6 +1539,7 @@ class MSSQLConnectionConfig(ConnectionConfig):
     database: t.Optional[str] = ""
     timeout: t.Optional[int] = 0
     login_timeout: t.Optional[int] = 60
+    login_attempts: t.Optional[int] = 1
     charset: t.Optional[str] = "UTF-8"
     appname: t.Optional[str] = None
     port: t.Optional[int] = 1433
@@ -1524,7 +1548,7 @@ class MSSQLConnectionConfig(ConnectionConfig):
     tds_version: t.Optional[str] = None
 
     # Driver options
-    driver: t.Literal["pymssql", "pyodbc"] = "pymssql"
+    driver: t.Literal["pymssql", "pyodbc", "mssql-python"] = "pymssql"
     # PyODBC specific options
     driver_name: t.Optional[str] = None  # e.g. "ODBC Driver 18 for SQL Server"
     trust_server_certificate: t.Optional[bool] = None
@@ -1551,7 +1575,11 @@ class MSSQLConnectionConfig(ConnectionConfig):
         driver = data.get("driver", "pymssql")
 
         # Define the mapping of driver to import module and extra name
-        driver_configs = {"pymssql": ("pymssql", "mssql"), "pyodbc": ("pyodbc", "mssql-odbc")}
+        driver_configs = {
+            "pymssql": ("pymssql", "mssql"),
+            "pyodbc": ("pyodbc", "mssql-odbc"),
+            "mssql-python": ("mssql_python", "mssql-python"),
+        }
 
         if driver not in driver_configs:
             raise ValueError(f"Unsupported driver: {driver}")
@@ -1597,6 +1625,19 @@ class MSSQLConnectionConfig(ConnectionConfig):
             base_keys.discard("tds_version")
             base_keys.discard("conn_properties")
 
+        elif self.driver == "mssql-python":
+            base_keys.update(
+                {
+                    "trust_server_certificate",
+                    "encrypt",
+                    "odbc_properties",
+                    "login_attempts",
+                }
+            )
+            # Remove pymssql-specific parameters
+            base_keys.discard("tds_version")
+            base_keys.discard("conn_properties")
+
         return base_keys
 
     @property
@@ -1610,95 +1651,212 @@ class MSSQLConnectionConfig(ConnectionConfig):
 
             return pymssql.connect
 
-        import pyodbc
+        if self.driver == "mssql-python":
+            # The `mssql-python` implementation is API-compatible with
+            # with the `pyodbc` equivalent for documented parameters.
 
-        def connect(**kwargs: t.Any) -> t.Callable:
-            # Extract parameters for connection string
-            host = kwargs.pop("host")
-            port = kwargs.pop("port", 1433)
-            database = kwargs.pop("database", "")
-            user = kwargs.pop("user", None)
-            password = kwargs.pop("password", None)
-            driver_name = kwargs.pop("driver_name", "ODBC Driver 18 for SQL Server")
-            trust_server_certificate = kwargs.pop("trust_server_certificate", False)
-            encrypt = kwargs.pop("encrypt", True)
-            login_timeout = kwargs.pop("login_timeout", 60)
+            if not SUPPORTS_MSSQL_PYTHON_DRIVER:
+                raise ConfigError("The `mssql-python` driver requires Python 3.10 or higher.")
 
-            # Build connection string
-            conn_str_parts = [
-                f"DRIVER={{{driver_name}}}",
-                f"SERVER={host},{port}",
-            ]
+            import mssql_python
 
-            if database:
-                conn_str_parts.append(f"DATABASE={database}")
+            def connect_mssql_python(**kwargs: t.Any) -> t.Callable:
+                # Extract parameters for connection string
+                host = kwargs.pop("host")
+                port = kwargs.pop("port", 1433)
+                database = kwargs.pop("database", "")
+                user = kwargs.pop("user", None)
+                password = kwargs.pop("password", None)
+                authentication = kwargs.pop("authentication", None)
+                trust_server_certificate = kwargs.pop("trust_server_certificate", False)
+                encrypt = kwargs.pop("encrypt", True)
+                timeout = kwargs.pop("timeout", 0)
+                login_timeout = kwargs.pop("login_timeout", 59)
+                login_attempts = kwargs.pop("login_attempts", 1)
 
-            # Add security options
-            conn_str_parts.append(f"Encrypt={'YES' if encrypt else 'NO'}")
-            if trust_server_certificate:
-                conn_str_parts.append("TrustServerCertificate=YES")
+                # Build connection string
+                conn_str_parts = [
+                    f"Server={host},{port}",
+                ]
 
-            conn_str_parts.append(f"Connection Timeout={login_timeout}")
+                if database:
+                    conn_str_parts.append(f"Database={database}")
 
-            # Standard SQL Server authentication
-            if user:
-                conn_str_parts.append(f"UID={user}")
-            if password:
-                conn_str_parts.append(f"PWD={password}")
+                # Add security options
+                conn_str_parts.append(f"Encrypt={'yes' if encrypt else 'no'}")
+                if trust_server_certificate:
+                    conn_str_parts.append("TrustServerCertificate=yes")
 
-            # Add any additional ODBC properties from the odbc_properties dictionary
-            if self.odbc_properties:
-                for key, value in self.odbc_properties.items():
-                    # Skip properties that we've already set above
-                    if key.lower() in (
-                        "driver",
-                        "server",
-                        "database",
-                        "uid",
-                        "pwd",
-                        "encrypt",
-                        "trustservercertificate",
-                        "connection timeout",
-                    ):
-                        continue
+                # `Connection Timeout=` is not a valid option so we leverage `ConnectRetry*`.
+                # See the following:
+                # - https://github.com/microsoft/mssql-python/issues/339
+                # - https://github.com/microsoft/mssql-python/wiki/Connection-to-SQL-Database
+                # - https://github.com/microsoft/mssql-python/wiki/Connection#timeout
+                conn_str_parts.append(f"ConnectRetryCount={login_attempts}")
+                conn_str_parts.append(f"ConnectRetryInterval={min(int(login_timeout), 60)}")
 
-                    # Handle boolean values properly
-                    if isinstance(value, bool):
-                        conn_str_parts.append(f"{key}={'YES' if value else 'NO'}")
-                    else:
-                        conn_str_parts.append(f"{key}={value}")
+                # Standard SQL Server authentication
+                if user:
+                    conn_str_parts.append(f"UID={user}")
+                if password:
+                    conn_str_parts.append(f"PWD={password}")
+                if authentication:
+                    conn_str_parts.append(f"Authentication={authentication}")
 
-            # Create the connection string
-            conn_str = ";".join(conn_str_parts)
+                # Add any additional ODBC properties from the odbc_properties dictionary
+                if self.odbc_properties:
+                    for key, value in self.odbc_properties.items():
+                        # Skip properties that we've already set above
+                        if key.lower() in (
+                            "driver",
+                            "server",
+                            "database",
+                            "uid",
+                            "pwd",
+                            "encrypt",
+                            "trustservercertificate",
+                            "connectretrycount",
+                            "connectretryinterval",
+                            "connection timeout",
+                        ):
+                            continue
 
-            conn = pyodbc.connect(conn_str, autocommit=kwargs.get("autocommit", False))
+                        # Handle boolean values properly
+                        if isinstance(value, bool):
+                            conn_str_parts.append(f"{key}={'yes' if value else 'no'}")
+                        else:
+                            conn_str_parts.append(f"{key}={value}")
 
-            # Set up output converters for MSSQL-specific data types
-            # Handle SQL type -155 (DATETIMEOFFSET) which is not yet supported by pyodbc
-            # ref: https://github.com/mkleehammer/pyodbc/issues/134#issuecomment-281739794
-            def handle_datetimeoffset(dto_value: t.Any) -> t.Any:
-                from datetime import datetime, timedelta, timezone
-                import struct
+                # Create the connection
+                conn_str = ";".join(conn_str_parts)
 
-                # Unpack the DATETIMEOFFSET binary format:
-                # Format: <6hI2h = (year, month, day, hour, minute, second, nanoseconds, tz_hour_offset, tz_minute_offset)
-                tup = struct.unpack("<6hI2h", dto_value)
-                return datetime(
-                    tup[0],
-                    tup[1],
-                    tup[2],
-                    tup[3],
-                    tup[4],
-                    tup[5],
-                    tup[6] // 1000,
-                    timezone(timedelta(hours=tup[7], minutes=tup[8])),
+                conn = mssql_python.connect(
+                    conn_str,
+                    autocommit=kwargs.get("autocommit", False),
+                    timeout=timeout,
                 )
 
-            conn.add_output_converter(-155, handle_datetimeoffset)
+                # TODO: Remove this output converter as DATETIMEOFFSET
+                # should be handled natively by `mssql-python`.
+                # see "https://github.com/microsoft/mssql-python/issues/213"
 
-            return conn
+                def handle_datetimeoffset_mssql_python(dto_value: t.Any) -> t.Any:
+                    import struct
+                    from datetime import datetime, timedelta, timezone
 
-        return connect
+                    # Unpack the DATETIMEOFFSET binary format:
+                    # Format: <6hI2h = (year, month, day, hour, minute, second, nanoseconds, tz_hour_offset, tz_minute_offset)
+                    tup = struct.unpack("<6hI2h", dto_value)
+                    return datetime(
+                        tup[0],
+                        tup[1],
+                        tup[2],
+                        tup[3],
+                        tup[4],
+                        tup[5],
+                        tup[6] // 1000,
+                        timezone(timedelta(hours=tup[7], minutes=tup[8])),
+                    )
+
+                conn.add_output_converter(-155, handle_datetimeoffset_mssql_python)
+
+                return t.cast(t.Any, conn)
+
+            return connect_mssql_python
+
+        if self.driver == "pyodbc":
+
+            def connect_pyodbc(**kwargs: t.Any) -> t.Callable:
+                # Extract parameters for connection string
+                host = kwargs.pop("host")
+                port = kwargs.pop("port", 1433)
+                database = kwargs.pop("database", "")
+                user = kwargs.pop("user", None)
+                password = kwargs.pop("password", None)
+                driver_name = kwargs.pop("driver_name", "ODBC Driver 18 for SQL Server")
+                trust_server_certificate = kwargs.pop("trust_server_certificate", False)
+                encrypt = kwargs.pop("encrypt", True)
+                login_timeout = kwargs.pop("login_timeout", 60)
+
+                # Build connection string
+                conn_str_parts = [
+                    f"DRIVER={{{driver_name}}}",
+                    f"SERVER={host},{port}",
+                ]
+
+                if database:
+                    conn_str_parts.append(f"DATABASE={database}")
+
+                # Add security options
+                conn_str_parts.append(f"Encrypt={'YES' if encrypt else 'NO'}")
+                if trust_server_certificate:
+                    conn_str_parts.append("TrustServerCertificate=YES")
+
+                conn_str_parts.append(f"Connection Timeout={login_timeout}")
+
+                # Standard SQL Server authentication
+                if user:
+                    conn_str_parts.append(f"UID={user}")
+                if password:
+                    conn_str_parts.append(f"PWD={password}")
+
+                # Add any additional ODBC properties from the odbc_properties dictionary
+                if self.odbc_properties:
+                    for key, value in self.odbc_properties.items():
+                        # Skip properties that we've already set above
+                        if key.lower() in (
+                            "driver",
+                            "server",
+                            "database",
+                            "uid",
+                            "pwd",
+                            "encrypt",
+                            "trustservercertificate",
+                            "connection timeout",
+                        ):
+                            continue
+
+                        # Handle boolean values properly
+                        if isinstance(value, bool):
+                            conn_str_parts.append(f"{key}={'YES' if value else 'NO'}")
+                        else:
+                            conn_str_parts.append(f"{key}={value}")
+
+                # Create the connection
+                conn_str = ";".join(conn_str_parts)
+
+                import pyodbc
+
+                conn = pyodbc.connect(conn_str, autocommit=kwargs.get("autocommit", False))
+
+                # Set up output converters for MSSQL-specific data types
+                # Handle SQL type -155 (DATETIMEOFFSET) which is not yet supported by pyodbc
+                # ref: https://github.com/mkleehammer/pyodbc/issues/134#issuecomment-281739794
+                def handle_datetimeoffset_pyodbc(dto_value: t.Any) -> t.Any:
+                    import struct
+                    from datetime import datetime, timedelta, timezone
+
+                    # Unpack the DATETIMEOFFSET binary format:
+                    # Format: <6hI2h = (year, month, day, hour, minute, second, nanoseconds, tz_hour_offset, tz_minute_offset)
+                    tup = struct.unpack("<6hI2h", dto_value)
+                    return datetime(
+                        tup[0],
+                        tup[1],
+                        tup[2],
+                        tup[3],
+                        tup[4],
+                        tup[5],
+                        tup[6] // 1000,
+                        timezone(timedelta(hours=tup[7], minutes=tup[8])),
+                    )
+
+                conn.add_output_converter(-155, handle_datetimeoffset_pyodbc)
+
+                return t.cast(t.Any, conn)
+
+            return connect_pyodbc
+
+        raise ValueError(f"Unsupported driver: {self.driver}")
 
     @property
     def _extra_engine_config(self) -> t.Dict[str, t.Any]:
@@ -1726,7 +1884,7 @@ class FabricConnectionConfig(MSSQLConnectionConfig):
     DIALECT: t.ClassVar[t.Literal["fabric"]] = "fabric"  # type: ignore
     DISPLAY_NAME: t.ClassVar[t.Literal["Fabric"]] = "Fabric"  # type: ignore
     DISPLAY_ORDER: t.ClassVar[t.Literal[17]] = 17  # type: ignore
-    driver: t.Literal["pyodbc"] = "pyodbc"
+    driver: t.Literal["pyodbc", "mssql-python"] = "pyodbc"
     workspace_id: str
     tenant_id: str
     autocommit: t.Optional[bool] = True
@@ -2102,6 +2260,7 @@ class ClickhouseConnectionConfig(ConnectionConfig):
     password: t.Optional[str] = None
     port: t.Optional[int] = None
     cluster: t.Optional[str] = None
+    virtual_catalog: t.Optional[str] = None
     connect_timeout: int = 10
     send_receive_timeout: int = 300
     query_limit: int = 0
@@ -2136,6 +2295,19 @@ class ClickhouseConnectionConfig(ConnectionConfig):
 
     _engine_import_validator = _get_engine_import_validator("clickhouse_connect", "clickhouse")
 
+    @field_validator("virtual_catalog")
+    def validate_virtual_catalog(cls, v: t.Optional[str]) -> t.Optional[str]:
+        if v is not None and not v.strip():
+            raise ConfigError(
+                "virtual_catalog cannot be an empty string. "
+                "Omit the field to use the default synthetic prefix (__<gateway_name>__)."
+            )
+        if v is not None and "." in v:
+            raise ConfigError(
+                f"virtual_catalog must be a single identifier with no dots (got: {v!r})"
+            )
+        return v
+
     @property
     def _connection_kwargs_keys(self) -> t.Set[str]:
         kwargs = {
@@ -2164,9 +2336,10 @@ class ClickhouseConnectionConfig(ConnectionConfig):
 
     @property
     def _connection_factory(self) -> t.Callable:
+        from functools import partial
+
         from clickhouse_connect.dbapi import connect  # type: ignore
         from clickhouse_connect.driver import httputil  # type: ignore
-        from functools import partial
 
         pool_manager_options: t.Dict[str, t.Any] = dict(
             # Match the maxsize to the number of concurrent tasks
@@ -2197,7 +2370,11 @@ class ClickhouseConnectionConfig(ConnectionConfig):
 
     @property
     def _extra_engine_config(self) -> t.Dict[str, t.Any]:
-        return {"cluster": self.cluster, "cloud_mode": self.cloud_mode}
+        return {
+            "cluster": self.cluster,
+            "cloud_mode": self.cloud_mode,
+            "virtual_catalog": self.virtual_catalog,
+        }
 
     @property
     def _static_connection_kwargs(self) -> t.Dict[str, t.Any]:
@@ -2366,10 +2543,171 @@ class RisingwaveConnectionConfig(ConnectionConfig):
         return init
 
 
+class StarRocksConnectionConfig(ConnectionConfig):
+    """Configuration for the StarRocks connection.
+
+    StarRocks uses MySQL network protocol and is compatible with MySQL ecosystem tools,
+    JDBC/ODBC drivers, and various visualization tools.
+
+    Args:
+        host: The hostname of the StarRocks FE (Frontend) node.
+        user: The StarRocks username.
+        password: The StarRocks password.
+        port: The port number of the StarRocks FE node. Default is 9030.
+        database: The optional database name.
+        charset: The optional character set.  TODO: may be not supported yet.
+        collation: The optional collation.  TODO: may be not supported yet.
+        ssl_disabled: Whether to disable SSL connection.  TODO: need to check it.
+        concurrent_tasks: The maximum number of tasks that can use this connection concurrently.
+        register_comments: Whether or not to register model comments with the SQL engine.
+        local_infile: Whether or not to allow local file access.
+        pre_ping: Whether or not to pre-ping the connection before starting a new transaction to ensure it is still alive.
+    """
+
+    host: str
+    user: str
+    password: str
+    port: t.Optional[int] = 9030
+    database: t.Optional[str] = None
+    charset: t.Optional[str] = None
+    collation: t.Optional[str] = None
+    ssl_disabled: t.Optional[bool] = None
+
+    concurrent_tasks: int = 4
+    register_comments: bool = True
+    local_infile: bool = False
+    pre_ping: bool = True
+
+    type_: t.Literal["starrocks"] = Field(alias="type", default="starrocks")
+    DIALECT: t.ClassVar[t.Literal["starrocks"]] = "starrocks"
+    DISPLAY_NAME: t.ClassVar[t.Literal["StarRocks"]] = "StarRocks"
+    DISPLAY_ORDER: t.ClassVar[t.Literal[18]] = 18
+
+    _engine_import_validator = _get_engine_import_validator("pymysql", "starrocks")
+
+    @property
+    def _connection_kwargs_keys(self) -> t.Set[str]:
+        connection_keys = {
+            "host",
+            "user",
+            "password",
+        }
+        if self.port is not None:
+            connection_keys.add("port")
+        if self.database is not None:
+            connection_keys.add("database")
+        if self.charset is not None:
+            connection_keys.add("charset")
+        if self.collation is not None:
+            connection_keys.add("collation")
+        if self.ssl_disabled is not None:
+            connection_keys.add("ssl_disabled")
+        if self.local_infile is not None:
+            connection_keys.add("local_infile")
+        return connection_keys
+
+    @property
+    def _engine_adapter(self) -> t.Type[EngineAdapter]:
+        return engine_adapter.StarRocksEngineAdapter
+
+    @property
+    def _connection_factory(self) -> t.Callable:
+        from pymysql import connect
+
+        return connect
+
+
 _CONNECTION_CONFIG_EXCLUDE: t.Set[t.Type[ConnectionConfig]] = {
     ConnectionConfig,  # type: ignore[type-abstract]
     BaseDuckDBConnectionConfig,  # type: ignore[type-abstract]
 }
+
+
+class Db2ConnectionConfig(ConnectionConfig):
+    host: str
+    port: int = 50000
+    database: str
+    db2_schema: str
+    username: str
+    password: str
+    ssl: bool = False
+    ssl_cert: t.Optional[str] = None
+    ssl_key: t.Optional[str] = None
+    ssl_ca: t.Optional[str] = None
+    connect_timeout: int = 30
+
+    concurrent_tasks: int = 4
+    register_comments: bool = True
+    pre_ping: bool = True
+
+    type_: t.Literal["db2"] = Field(alias="type", default="db2")
+    DIALECT: t.ClassVar[t.Literal["db2"]] = "db2"
+    DISPLAY_NAME: t.ClassVar[t.Literal["Db2"]] = "Db2"
+    DISPLAY_ORDER: t.ClassVar[t.Literal[19]] = 19
+
+    _engine_import_validator = _get_engine_import_validator("ibm_db", "db2")
+
+    @property
+    def _connection_kwargs_keys(self) -> t.Set[str]:
+        return {
+            "host",
+            "port",
+            "database",
+            "db2_schema",
+            "username",
+            "password",
+        }
+
+    @property
+    def _engine_adapter(self) -> t.Type[EngineAdapter]:
+        adapter = getattr(engine_adapter, "Db2EngineAdapter", None)
+        if adapter is None:
+            raise ConfigError(
+                "The Db2 engine adapter requires Python 3.10+ and the 'db2' extra. "
+                "Please install it with: pip install 'sqlmesh[db2]'"
+            )
+        return t.cast(t.Type[EngineAdapter], adapter)
+
+    def get_catalog(self) -> t.Optional[str]:
+        """Db2 stores catalog names in uppercase; normalise here so the default_catalog
+        passed to the adapter matches what get_current_catalog() returns at runtime."""
+        catalog = super().get_catalog()
+        return catalog.upper() if catalog else None
+
+    @property
+    def _connection_factory(self) -> t.Callable:
+        import ibm_db_dbi  # type: ignore
+
+        ssl = self.ssl
+        ssl_cert = self.ssl_cert
+        ssl_key = self.ssl_key
+        ssl_ca = self.ssl_ca
+        connect_timeout = self.connect_timeout
+
+        def connect_db2(**kwargs: t.Any) -> t.Any:
+            conn_str_parts = [
+                f"DATABASE={kwargs['database']}",
+                f"HOSTNAME={kwargs['host']}",
+                f"PORT={kwargs['port']}",
+                "PROTOCOL=TCPIP",
+                f"UID={kwargs['username']}",
+                f"PWD={kwargs['password']}",
+                f"CURRENTSCHEMA={kwargs['db2_schema']}",
+                f"CONNECTTIMEOUT={connect_timeout}",
+            ]
+            if ssl:
+                conn_str_parts.append("SECURITY=SSL")
+                if ssl_cert:
+                    conn_str_parts.append(f"SSLClientCertificate={ssl_cert}")
+                if ssl_key:
+                    conn_str_parts.append(f"SSLClientKey={ssl_key}")
+                if ssl_ca:
+                    conn_str_parts.append(f"SSLServerCertificate={ssl_ca}")
+            conn_str = ";".join(conn_str_parts) + ";"
+            return ibm_db_dbi.connect(conn_str, "", "")
+
+        return connect_db2
+
 
 CONNECTION_CONFIG_TO_TYPE = {
     # Map all subclasses of ConnectionConfig to the value of their `type_` field.
@@ -2426,7 +2764,8 @@ connection_config_validator: t.Callable = field_validator(
     "state_connection",
     "test_connection",
     "default_connection",
-    "default_test_connection",
+    # field_validator matches field names, not aliases
+    "default_test_connection_",
     mode="before",
     check_fields=False,
 )(_connection_config_validator)

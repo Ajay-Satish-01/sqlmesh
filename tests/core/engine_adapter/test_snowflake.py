@@ -1,4 +1,5 @@
 import typing as t
+from datetime import datetime, timezone
 
 import pandas as pd  # noqa: TID253
 import pytest
@@ -14,6 +15,7 @@ from sqlmesh.core.engine_adapter.shared import DataObjectType
 from sqlmesh.core.model import load_sql_based_model
 from sqlmesh.core.model.definition import SqlModel
 from sqlmesh.core.node import IntervalUnit
+from sqlmesh.utils.date import to_timestamp
 from sqlmesh.utils.errors import SQLMeshError
 from sqlmesh.utils import optional_import
 from tests.core.engine_adapter import to_sql_calls
@@ -71,6 +73,38 @@ def test_get_data_objects_lowercases_columns(
     assert data_object.name == "MY_TABLE"
     assert data_object.type == DataObjectType.TABLE
     assert data_object.clustering_key == "ID"
+
+
+def test_get_table_last_modified_ts_multiple_catalogs(
+    snowflake_mocked_engine_adapter: SnowflakeEngineAdapter,
+) -> None:
+    adapter = snowflake_mocked_engine_adapter
+    adapter.cursor.fetchall.side_effect = [
+        [
+            (datetime(2025, 1, 1, tzinfo=timezone.utc),),
+            (datetime(2025, 1, 2, tzinfo=timezone.utc),),
+        ],
+        [(datetime(2025, 1, 3, tzinfo=timezone.utc),)],
+    ]
+
+    result = adapter.get_table_last_modified_ts(
+        [
+            '"ANALYTICS"."STAGING"."ORDERS"',
+            '"RAW"."SHOPIFY"."ORDERS"',
+            '"ANALYTICS"."STAGING"."CUSTOMERS"',
+        ]
+    )
+
+    # INFORMATION_SCHEMA only covers the database it belongs to, so each database is queried separately
+    assert to_sql_calls(adapter) == [
+        """SELECT LAST_ALTERED FROM "ANALYTICS".INFORMATION_SCHEMA.TABLES WHERE (TABLE_NAME = 'ORDERS' AND TABLE_SCHEMA = 'STAGING') OR (TABLE_NAME = 'CUSTOMERS' AND TABLE_SCHEMA = 'STAGING')""",
+        """SELECT LAST_ALTERED FROM "RAW".INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'ORDERS' AND TABLE_SCHEMA = 'SHOPIFY'""",
+    ]
+    assert result == [
+        to_timestamp("2025-01-01"),
+        to_timestamp("2025-01-02"),
+        to_timestamp("2025-01-03"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -169,6 +203,29 @@ def test_session(
         ]
 
         assert to_sql_calls(adapter) == expected_exception_calls
+
+
+def test_get_table_last_modified_ts_quoted_and_unquoted_catalogs(
+    snowflake_mocked_engine_adapter: SnowflakeEngineAdapter,
+) -> None:
+    # unquoted raw resolves to the database RAW, quoted "raw" is a different database,
+    # so the two must be looked up in two different information schemas
+    adapter = snowflake_mocked_engine_adapter
+    adapter.cursor.fetchall.side_effect = [
+        [(datetime(2025, 1, 1, tzinfo=timezone.utc),)],
+        [(datetime(2025, 1, 2, tzinfo=timezone.utc),)],
+    ]
+
+    result = adapter.get_table_last_modified_ts(['"raw".shopify.orders', "raw.shopify.customers"])
+
+    assert result == [
+        to_timestamp(datetime(2025, 1, 1, tzinfo=timezone.utc)),
+        to_timestamp(datetime(2025, 1, 2, tzinfo=timezone.utc)),
+    ]
+    assert to_sql_calls(adapter) == [
+        """SELECT LAST_ALTERED FROM "raw".INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'orders' AND TABLE_SCHEMA = 'shopify'""",
+        """SELECT LAST_ALTERED FROM raw.INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'customers' AND TABLE_SCHEMA = 'shopify'""",
+    ]
 
 
 def test_comments(make_mocked_engine_adapter: t.Callable, mocker: MockerFixture):
@@ -467,6 +524,26 @@ def test_df_to_source_queries_use_schema(
         {"a": exp.DataType.build("INT"), "b": exp.DataType.build("INT")},
     )
     assert 'USE SCHEMA "other_catalog"."other_db"' in to_sql_calls(adapter)
+
+
+def test_df_to_source_queries_reset_non_default_index(
+    make_mocked_engine_adapter: t.Callable, mocker: MockerFixture
+):
+    mocker.patch(
+        "sqlmesh.core.engine_adapter.snowflake.SnowflakeEngineAdapter.table_exists",
+        return_value=False,
+    )
+    write_pandas = mocker.patch("snowflake.connector.pandas_tools.write_pandas", return_value=None)
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter)
+
+    df = pd.DataFrame({"a": [2, 3], "b": [5, 6]}, index=[1, 2])
+    adapter.replace_query(
+        "other_db.test_table", df, {"a": exp.DataType.build("INT"), "b": exp.DataType.build("INT")}
+    )
+
+    uploaded_df = write_pandas.call_args.args[1]
+    assert uploaded_df.index.equals(pd.RangeIndex(start=0, stop=2, step=1))
+    assert uploaded_df.to_dict("list") == {"a": [2, 3], "b": [5, 6]}
 
 
 def test_create_managed_table(make_mocked_engine_adapter: t.Callable, mocker: MockerFixture):
@@ -985,6 +1062,48 @@ def test_table_format_iceberg(snowflake_mocked_engine_adapter: SnowflakeEngineAd
         'CREATE ICEBERG TABLE IF NOT EXISTS "test"."table" ("a" INT) CATALOG=\'snowflake\' EXTERNAL_VOLUME=\'test\'',
         'CREATE ICEBERG TABLE IF NOT EXISTS "test"."table" CATALOG=\'snowflake\' EXTERNAL_VOLUME=\'test\' AS SELECT CAST("a" AS INT) AS "a" FROM (SELECT CAST("a" AS INT) AS "a") AS "_subquery"',
     ]
+
+
+def test_clone_table_iceberg(mocker: MockerFixture, make_mocked_engine_adapter: t.Callable):
+    mocker.patch("sqlmesh.core.engine_adapter.snowflake.SnowflakeEngineAdapter.set_current_catalog")
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter, default_catalog="test_catalog")
+
+    # Snowflake rejects `CREATE TABLE ... CLONE` for Iceberg tables
+    adapter.clone_table("target_table", "source_table", table_format="iceberg")
+    adapter.cursor.execute.assert_called_once_with(
+        'CREATE ICEBERG TABLE IF NOT EXISTS "target_table" CLONE "source_table"'
+    )
+
+    # Engines that don't need format-specific DDL are unaffected
+    adapter = make_mocked_engine_adapter(EngineAdapter, default_catalog="test_catalog")
+    adapter.SUPPORTS_CLONING = True
+    adapter.clone_table("target_table", "source_table", table_format="iceberg")
+    adapter.cursor.execute.assert_called_once_with(
+        'CREATE TABLE IF NOT EXISTS "target_table" CLONE "source_table"'
+    )
+
+
+def test_alter_table_iceberg(mocker: MockerFixture, make_mocked_engine_adapter: t.Callable):
+    mocker.patch("sqlmesh.core.engine_adapter.snowflake.SnowflakeEngineAdapter.set_current_catalog")
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter, default_catalog="test_catalog")
+
+    current_table = {"a": "INT"}
+    target_table = {"a": "INT", "b": "INT"}
+    adapter.columns = lambda table_name, **kwargs: {
+        k: exp.DataType.build(v)
+        for k, v in (current_table if table_name == "test_table" else target_table).items()
+    }
+
+    alter_operations = adapter.get_alter_operations("test_table", "target_table")
+
+    # Snowflake rejects `ALTER TABLE` for Iceberg tables
+    adapter.alter_table(alter_operations, table_format="iceberg")
+    assert to_sql_calls(adapter) == ['ALTER ICEBERG TABLE "test_table" ADD "b" INT']
+
+    # Without a table format the regular `ALTER TABLE` is used
+    adapter = make_mocked_engine_adapter(SnowflakeEngineAdapter, default_catalog="test_catalog")
+    adapter.alter_table(alter_operations)
+    assert to_sql_calls(adapter) == ['ALTER TABLE "test_table" ADD "b" INT']
 
 
 def test_create_view_with_schema_and_grants(
