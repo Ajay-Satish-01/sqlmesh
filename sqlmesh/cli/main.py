@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import typing as t
+from datetime import datetime, tzinfo
 from pathlib import Path
 
 import click
@@ -22,7 +23,12 @@ from sqlmesh.core.config import load_configs
 from sqlmesh.core.console import configure_console, get_console
 from sqlmesh.core.context import Context
 from sqlmesh.utils import Verbosity
-from sqlmesh.utils.date import TimeLike
+from sqlmesh.utils.date import (
+    TimeLike,
+    is_categorical_relative_expression,
+    parse_time_zone,
+    to_datetime,
+)
 from sqlmesh.utils.errors import MissingDependencyError, SQLMeshError
 
 logger = logging.getLogger(__name__)
@@ -55,6 +61,57 @@ class _SQLMeshGroup(click.Group):
             protected_args = ctx.protected_args
         ctx.meta["subcommand_args"] = tuple(protected_args) + tuple(ctx.args)
         return rest
+
+
+def _resolve_day_sized(
+    value: t.Optional[TimeLike],
+    relative_tz: tzinfo,
+    relative_base: t.Optional[datetime] = None,
+) -> t.Optional[TimeLike]:
+    if isinstance(value, str) and is_categorical_relative_expression(value):
+        return to_datetime(value, relative_base=relative_base, relative_tz=relative_tz)
+    return value
+
+
+def _resolve_time_zone_args(
+    start: t.Optional[TimeLike],
+    end: t.Optional[TimeLike],
+    execution_time: t.Optional[TimeLike],
+    time_zone: t.Optional[str],
+) -> t.Tuple[t.Optional[TimeLike], t.Optional[TimeLike], t.Optional[TimeLike]]:
+    """Turn day-sized relative bounds into UTC timestamps.
+
+    Phrases such as "1 week ago", "today", and "yesterday" are anchored to midnight in
+    `time_zone`. Sub-day phrases and absolute timestamps are left unchanged so downstream
+    plan, render, and macro handling keep using one UTC timestamp.
+    """
+    if not time_zone:
+        return start, end, execution_time
+
+    relative_tz = parse_time_zone(time_zone)
+    if relative_tz is None:
+        return start, end, execution_time
+
+    execution_time = _resolve_day_sized(execution_time, relative_tz)
+    relative_base = to_datetime(execution_time) if execution_time is not None else None
+    start = _resolve_day_sized(start, relative_tz, relative_base)
+    end = _resolve_day_sized(end, relative_tz, relative_base)
+    return start, end, execution_time
+
+
+def _apply_time_zone_kwargs(kwargs: t.Dict[str, t.Any]) -> None:
+    start, end, execution_time = _resolve_time_zone_args(
+        kwargs.get("start"),
+        kwargs.get("end"),
+        kwargs.get("execution_time"),
+        kwargs.pop("time_zone", None),
+    )
+    if "start" in kwargs:
+        kwargs["start"] = start
+    if "end" in kwargs:
+        kwargs["end"] = end
+    if "execution_time" in kwargs:
+        kwargs["execution_time"] = execution_time
 
 
 def _sqlmesh_version() -> str:
@@ -308,6 +365,9 @@ def render(
     **format_kwargs: t.Any,
 ) -> None:
     """Render a model's query, optionally expanding referenced models."""
+    start, end, execution_time = _resolve_time_zone_args(  # type: ignore[assignment]
+        start, end, execution_time, time_zone
+    )
     model = ctx.obj.get_model(model, raise_if_missing=True)
 
     rendered = ctx.obj.render(
@@ -315,7 +375,6 @@ def render(
         start=start,
         end=end,
         execution_time=execution_time,
-        time_zone=time_zone,
         expand=expand,
     )
 
@@ -360,12 +419,14 @@ def evaluate(
     limit: t.Optional[int] = None,
 ) -> None:
     """Evaluate a model and return a dataframe with a default limit of 1000."""
+    start, end, execution_time = _resolve_time_zone_args(  # type: ignore[assignment]
+        start, end, execution_time, time_zone
+    )
     df = ctx.obj.evaluate(
         model,
         start=start,
         end=end,
         execution_time=execution_time,
-        time_zone=time_zone,
         limit=limit,
     )
     if hasattr(df, "show"):
@@ -592,6 +653,7 @@ def plan(
 ) -> None:
     """Apply local changes to the target environment."""
     context = ctx.obj
+    _apply_time_zone_kwargs(kwargs)
     restate_models = kwargs.pop("restate_model") or None
     select_models = kwargs.pop("select_model") or None
     allow_destructive_models = kwargs.pop("allow_destructive_model") or None
@@ -645,6 +707,7 @@ def plan(
 def run(ctx: click.Context, environment: t.Optional[str] = None, **kwargs: t.Any) -> None:
     """Evaluate missing intervals for the target environment."""
     context = ctx.obj
+    _apply_time_zone_kwargs(kwargs)
     select_models = kwargs.pop("select_model") or None
     completion_status = context.run(environment, select_models=select_models, **kwargs)
     if completion_status.is_failure:
@@ -887,9 +950,10 @@ def audit(
     time_zone: t.Optional[str] = None,
 ) -> None:
     """Run audits for the target model(s)."""
-    if not obj.audit(
-        models=models, start=start, end=end, execution_time=execution_time, time_zone=time_zone
-    ):
+    start, end, execution_time = _resolve_time_zone_args(  # type: ignore[assignment]
+        start, end, execution_time, time_zone
+    )
+    if not obj.audit(models=models, start=start, end=end, execution_time=execution_time):
         exit(1)
 
 
@@ -923,6 +987,9 @@ def check_intervals(
     time_zone: t.Optional[str] = None,
 ) -> None:
     """Show missing intervals in an environment, respecting signals."""
+    start, end, _ = _resolve_time_zone_args(  # type: ignore[assignment]
+        start, end, None, time_zone
+    )
     context = ctx.obj
     context.console.show_intervals(
         context.check_intervals(
@@ -931,7 +998,6 @@ def check_intervals(
             select_models=select_model,
             start=start,
             end=end,
-            time_zone=time_zone,
         )
     )
 

@@ -46,7 +46,7 @@ from sqlmesh.core.config.ui import UIConfig
 from sqlmesh.core.loader import Loader, SqlMeshLoader
 from sqlmesh.core.notification_target import NotificationTarget
 from sqlmesh.core.user import User
-from sqlmesh.utils.date import parse_time_zone, to_timestamp, now
+from sqlmesh.utils.date import to_timestamp, now
 from sqlmesh.utils.errors import ConfigError
 from sqlmesh.utils.pydantic import model_validator
 
@@ -76,14 +76,6 @@ def validate_regex_key_dict(value: t.Dict[str | re.Pattern, t.Any]) -> t.Dict[re
     return compile_regex_mapping(value)
 
 
-def validate_time_zone(v: t.Any) -> t.Optional[str]:
-    if not v or v == "UTC":
-        return None
-    v = str(v)
-    parse_time_zone(v)
-    return v
-
-
 def _canonicalize(obj: object) -> object:
     """Recursively convert an object into a canonical, order-stable form for hashing.
 
@@ -108,12 +100,10 @@ if t.TYPE_CHECKING:
     NoPastTTLString = str
     GatewayDict = t.Dict[str, GatewayConfig]
     RegexKeyDict = t.Dict[re.Pattern, str]
-    TimeZoneString = t.Optional[str]
 else:
     NoPastTTLString = t.Annotated[str, BeforeValidator(validate_no_past_ttl)]
     GatewayDict = t.Annotated[t.Dict[str, GatewayConfig], BeforeValidator(gateways_ensure_dict)]
     RegexKeyDict = t.Annotated[t.Dict[re.Pattern, str], BeforeValidator(validate_regex_key_dict)]
-    TimeZoneString = t.Annotated[t.Optional[str], BeforeValidator(validate_time_zone)]
 
 
 class Config(BaseConfig):
@@ -157,8 +147,6 @@ class Config(BaseConfig):
         before_all: SQL statements or macros to be executed at the start of the `sqlmesh plan` and `sqlmesh run` commands.
         after_all: SQL statements or macros to be executed at the end of the `sqlmesh plan` and `sqlmesh run` commands.
         cache_dir: The directory to store the SQLMesh cache. Defaults to .cache in the project folder.
-        time_zone: IANA timezone for interpreting relative start, end, and execution-time values.
-            Defaults to UTC when unset.
     """
 
     gateways: GatewayDict = {"": GatewayConfig()}
@@ -204,7 +192,6 @@ class Config(BaseConfig):
     linter: LinterConfig = LinterConfig()
     janitor: JanitorConfig = JanitorConfig()
     cache_dir: t.Optional[str] = None
-    time_zone: TimeZoneString = None
     dbt: t.Optional[DbtConfig] = None
 
     _FIELD_UPDATE_STRATEGY: t.ClassVar[t.Dict[str, UpdateStrategy]] = {

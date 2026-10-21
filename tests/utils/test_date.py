@@ -82,10 +82,13 @@ def test_to_datetime_with_expressions(expression, result) -> None:
 @time_machine.travel("2023-01-20 12:30:30 UTC", tick=False)
 def test_to_datetime_with_relative_tz() -> None:
     la_tz = parse_time_zone("America/Los_Angeles")
+    assert la_tz is not None
     assert to_datetime("1 week ago") == datetime(2023, 1, 13, 0, 0, 0, tzinfo=UTC)
     assert to_datetime("1 week ago", relative_tz=la_tz) == datetime(
         2023, 1, 13, 8, 0, 0, tzinfo=UTC
     )
+    assert to_datetime("today", relative_tz=la_tz) == datetime(2023, 1, 20, 8, 0, 0, tzinfo=UTC)
+    assert to_datetime("yesterday", relative_tz=la_tz) == datetime(2023, 1, 19, 8, 0, 0, tzinfo=UTC)
     assert to_datetime("2020-01-01", relative_tz=la_tz) == datetime(2020, 1, 1, tzinfo=UTC)
 
 
@@ -98,18 +101,16 @@ def test_to_datetime_with_relative_tz_tokyo() -> None:
 
 
 @time_machine.travel("2023-01-20 15:00:00 UTC", tick=False)
-def test_date_dict_with_relative_tz() -> None:
+def test_date_dict_uses_utc_timestamp_from_day_sized_relative() -> None:
     tokyo_tz = parse_time_zone("Asia/Tokyo")
-    resp = date_dict(
-        "2023-01-20 15:00:00",
-        "1 day ago",
-        "2023-01-20",
-        relative_tz=tokyo_tz,
-    )
-    assert resp["start_dt"] == datetime(2023, 1, 19, 15, 0, 0, tzinfo=UTC)
-    assert resp["start_ds"] == "2023-01-20"
-    assert resp["start_date"] == date(2023, 1, 20)
-    assert resp["execution_ds"] == "2023-01-20"
+    start = to_datetime("1 day ago", relative_tz=tokyo_tz)
+    assert start == datetime(2023, 1, 19, 15, 0, 0, tzinfo=UTC)
+
+    resp = date_dict("2023-01-20 15:00:00", start, "2023-01-20")
+    assert resp["start_dt"] == start
+    assert resp["start_tstz"] == "2023-01-19 15:00:00+00:00"
+    assert resp["start_ds"] == "2023-01-19"
+    assert resp["start_date"] == date(2023, 1, 19)
     assert resp["end_ds"] == "2023-01-20"
 
 
@@ -120,33 +121,8 @@ def test_parse_time_zone() -> None:
     assert la_tz is not None
     assert la_tz.key == "America/Los_Angeles"
 
-    with pytest.raises(ConfigError, match="valid IANA timezone"):
+    with pytest.raises(ConfigError, match="not a valid IANA timezone name"):
         parse_time_zone("Not/A_Timezone")
-
-
-def test_date_dict_interval_bounds_use_utc_ds_with_relative_tz() -> None:
-    tokyo_tz = parse_time_zone("Asia/Tokyo")
-    interval_start = to_datetime("2023-01-20 00:00:00")
-    resp = date_dict(
-        "2023-01-20 15:00:00",
-        interval_start,
-        interval_start,
-        relative_tz=tokyo_tz,
-    )
-    assert resp["start_ds"] == "2023-01-20"
-    assert resp["start_dt"] == interval_start
-
-
-def test_date_dict_absolute_start_uses_utc_ds_with_relative_tz() -> None:
-    la_tz = parse_time_zone("America/Los_Angeles")
-    resp = date_dict(
-        "2023-01-20 12:00:00",
-        "2023-01-13",
-        "2023-01-20",
-        relative_tz=la_tz,
-    )
-    assert resp["start_ds"] == "2023-01-13"
-    assert resp["end_ds"] == "2023-01-20"
 
 
 def test_to_timestamp_from_date_string() -> None:

@@ -39,7 +39,11 @@ execution_time = click.option(
 
 time_zone = click.option(
     "--time-zone",
-    help="IANA timezone for interpreting relative --start, --end, and --execution-time values (e.g. America/Los_Angeles). Defaults to UTC.",
+    help=(
+        "IANA timezone for day-sized relative dates such as '1 week ago', 'today', and "
+        "'yesterday' (for example, America/Los_Angeles). Those values are converted to UTC "
+        "timestamps. Defaults to UTC."
+    ),
 )
 
 expand = click.option(
